@@ -14,7 +14,7 @@ import { WebhooksService } from '../webhooks/webhooks.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { MerchantsService } from '../merchants/merchants.service';
 import { PaginatedResponseDto } from '../common/dto/pagination.dto';
-import { SorobanService, PaymentExpiredError } from '../blockchain-wallet/soroban.service';
+import { PaymentEscrowService, PaymentExpiredError } from '../blockchain-wallet/payment-escrow.service';
 import { AnalyticsService } from '../analytics/analytics.service';
 
 // Events emitted per payment in a batch — mirrors contract PaymentCreated events
@@ -38,7 +38,7 @@ export class PaymentsService {
     private webhooks: WebhooksService,
     private notifications: NotificationsService,
     private merchants: MerchantsService,
-    private soroban: SorobanService,
+    private soroban: PaymentEscrowService,
     private analytics: AnalyticsService,
     private dataSource: DataSource,
   ) {}
@@ -96,7 +96,7 @@ export class PaymentsService {
 
     // Register in Soroban contract with ledger-based expiry.
     // expiryLedgers defaults to 360 (≈ 30 min at 1 ledger/5 s).
-    const expiryLedgers = (dto.expiryMinutes ?? 30) * SorobanService.LEDGERS_PER_MINUTE;
+    const expiryLedgers = (dto.expiryMinutes ?? 30) * PaymentEscrowService.LEDGERS_PER_MINUTE;
     const contractPayment = this.soroban.createPayment(
       saved.id,
       depositAddress,
@@ -249,10 +249,10 @@ export class PaymentsService {
       return manager.save(Payment, records);
     });
 
-    // ── Emit events after successful persistence ──────────────────────────────
+    // ── Emit PaymentCreated event for each entry (mirrors contract event log) ──
     for (const event of events) {
       this.logger.log(
-        `PaymentCreated: ${event.paymentId} (${event.amountUsd} USD) for merchant ${event.merchantId}`,
+        `PaymentCreated ${event.paymentId} merchant=${event.merchantId} amountUsd=${event.amountUsd}`,
       );
     }
 
@@ -266,36 +266,14 @@ export class PaymentsService {
         expiresAt: p.expiresAt,
       })),
       count: saved.length,
+      payments: saved.map((p) => ({
+        id: p.id,
+        reference: p.reference,
+        amountUsd: p.amountUsd,
+        amountXlm: p.amountXlm,
+        status: p.status,
+      })),
     };
-  }
-
-  async findAll(
-    merchantId: string,
-    page = 1,
-    limit = 20,
-  ): Promise<PaginatedResponseDto<Payment>> {
-    const [items, total] = await this.paymentsRepo.findAndCount({
-      where: { merchantId },
-      order: { createdAt: 'DESC' },
-      skip: (page - 1) * limit,
-      take: limit,
-    });
-
-    return {
-      items,
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
-    };
-  }
-
-  async findOne(merchantId: string, paymentId: string): Promise<Payment> {
-    const payment = await this.paymentsRepo.findOne({
-      where: { id: paymentId, merchantId },
-    });
-    if (!payment) throw new NotFoundException('Payment not found');
-    return payment;
   }
 
   async refund(
@@ -310,11 +288,52 @@ export class PaymentsService {
     }
 
     payment.status = PaymentStatus.REFUNDED;
+    paymen
+    if (!payment) throw new NotFoundException('Payment not found');
+
+  async refund(
+    merchantId: string,
+    paymentId: string,
+    dto: RefundPaymentDto,
+  ): Promise<Payment> {
+    const payment = await this.findOne(merchantId, paymentId);
+    if (!payment) throw new NotFoundException('Payment not found');
+
+    if (payment.status !== PaymentStatus.CONFIRMED) {
+      throw new BadRequestException('Only confirmed payments can be refunded');
+    }
+
+    payment.status = PaymentStatus.REFUNDED;
     payment.refundReason = dto.reason;
     payment.refundedAt = new Date();
     const saved = await this.paymentsRepo.save(payment);
 
     this.analytics.clearCacheForMerchant(merchantId);
+
+    if (payment.status !== PaymentStatus.CONFIRMED) {
+      throw new BadRequestException('Only confirmed payments can be refunded');
+    }
+
+    const alreadyRefundedUsd = payment.refundedUsd ?? 0;
+    const remainingUsd = payment.amountUsd - alreadyRefundedUsd;
+
+    if (dto.amountUsd > remainingUsd) {
+      throw new BadRequestException(
+        `Refund amount exceeds remaining refundable balance of ${remainingUsd}`,
+      );
+    }
+
+    payment.refundedUsd = alreadyRefundedUsd + dto.amountUsd;
+    payment.status =
+      payment.refundedUsd >= payment.amountUsd
+        ? PaymentStatus.REFUNDED
+        : PaymentStatus.PARTIALLY_REFUNDED;
+    payment.refundReason = dto.reason;
+    payment.refundedAt = new Date();
+
+    const saved = await this.paymentsRepo.save(payment);
+
+    this.analytics.clearCacheForMerchant(payment.merchantId);
 
     return saved;
   }
