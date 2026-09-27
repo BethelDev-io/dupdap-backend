@@ -10,6 +10,8 @@ import { IdempotencyInterceptor } from '../payment/idempotency.interceptor';
 import { WebhooksModule } from '../webhooks/webhooks.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { MerchantsModule } from '../merchants/merchants.module';
+import { SorobanModule } from '../soroban/soroban.module';
+import { PaymentEscrowService } from '../blockchain-wallet/payment-escrow.service';
 import { SorobanService } from '../blockchain-wallet/soroban.service';
 import { AmlModule } from '../aml/aml.module';
 import { PaymentsSorobanListener } from './payments-soroban.listener';
@@ -26,7 +28,7 @@ import { PaymentsSorobanListener } from './payments-soroban.listener';
     forwardRef(() => AmlModule),
   ],
   controllers: [PaymentsController, PublicPaymentController],
-  providers: [PaymentsService, IdempotencyInterceptor, SorobanService, PaymentsSorobanListener],
+  providers: [PaymentsService, IdempotencyInterceptor, PaymentEscrowService, PaymentsSorobanListener],
   exports: [PaymentsService],
 })
 export class PaymentsModule {}
